@@ -41,346 +41,6 @@ import inspect  # 新增这一行
 from hoshino import log  # 确保 log 模块已导入
 logger = log.new_logger('auto_pcr')  # 初始化日志记录器
 
-# 控制台可能是 GBK(Windows)，print 里的 emoji(ℹ️⚠️❌ 等)直接写会抛
-# UnicodeEncodeError 并中断模块级代码(导致 sv 注册失败)。这里改为替换不抛。
-import sys
-for _s in (sys.stdout, sys.stderr):
-    if hasattr(_s, 'reconfigure'):
-        try:
-            _s.reconfigure(errors='replace')
-        except Exception:
-            pass
-
-
-def _safe_print(msg: str):
-    """GBK 控制台下打印 emoji 可能抛异常，这里永远不抛。
-
-    本函数被 chuangrichang.py 等其它模块复用，那些模块可能未做
-    stdout 重配置，所以不能假设 print 一定安全。
-    """
-    try:
-        print(msg)
-    except Exception:
-        try:
-            print(str(msg).encode('utf-8', 'replace').decode('utf-8', 'replace'))
-        except Exception:
-            pass
-
-# ====================================================================
-# 公网 IP 探测
-# --------------------------------------------------------------------
-# 原实现的问题：
-#   1. 只探测 api.ipify.org / ipinfo.io / ifconfig.me 等境外站点，国内
-#      网络经常全部超时；
-#   2. 超时后回退到 UDP 探测，拿到的是内网 IP（比如 10.0.0.5），却仍然
-#      当作公网 IP 返回；
-#   3. generate_address() 于是抛 ValueError，返回占位字符串
-#      "请手动填写公网IP:端口"，而这个占位符又被当成正常主机名拼进 URL，
-#      导致 #配置日常 给出的网页地址彻底不可用；
-#   4. 用 startswith("172.") 判断内网，会把 172.99.x.x 这类公网地址误判。
-# 现在的策略（按优先级）：
-#   ① cache/manual_address.txt 或环境变量 AUTOPCR_PUBLIC_IP 手工指定
-#   ② hoshino.config.PUBLIC_ADDRESS
-#   ③ 多源并发探测（含国内可直连站点），严格校验后返回公网 IP
-#   ④ 内网 IP 兜底（同局域网可用，并明确提示需要端口映射）
-# 全程不再返回"假公网 IP"，探测失败一律返回 None 交给上层处理。
-# ====================================================================
-
-MANUAL_ADDRESS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'cache', 'manual_address.txt')
-
-PUBLIC_IP_TTL = 6 * 3600          # 自动探测结果在内存中缓存 6 小时
-_public_ip_cache = {'ip': None, 'ts': 0.0}
-
-# 纯文本/可正则提取的取 IP 接口，国内可直连的排在前面
-_PUBLIC_IP_SOURCES = [
-    'https://ip.3322.net',
-    'https://myip.ipip.net',
-    'https://api.ip.sb/ip',
-    'https://ipv4.icanhazip.com',
-    'https://ifconfig.me/ip',
-    'https://api.ipify.org',
-    'https://ipinfo.io/ip',
-    'http://ip-api.com/line/?fields=query',
-    'https://www.cloudflare.com/cdn-cgi/trace',   # 多行文本，含 ip= 字段
-]
-
-
-def _extract_ip(text: str) -> str:
-    """从各种返回格式（纯文本 / JSON / 多行 trace）里提取 IPv4 字面量"""
-    try:
-        m = re.search(r'\b((?:\d{1,3}\.){3}\d{1,3})\b', str(text))
-        return m.group(1) if m else ''
-    except Exception:
-        return ''
-
-
-def _is_public_ipv4(ip: str) -> bool:
-    """严格判断是否为可用公网 IPv4（排除内网/回环/链路本地/保留段）"""
-    try:
-        import ipaddress
-        addr = ipaddress.ip_address(str(ip).strip())
-    except Exception:
-        return False
-    if addr.version != 4:
-        return False
-    if (addr.is_private or addr.is_loopback or addr.is_link_local
-            or addr.is_multicast or addr.is_reserved or addr.is_unspecified):
-        return False
-    return bool(getattr(addr, 'is_global', True))
-
-
-def _probe_public_ip(timeout: float = 6.0) -> str:
-    """多源并发探测公网 IP，任意一个返回合法公网地址即采用"""
-    try:
-        import concurrent.futures
-    except Exception:
-        return ''
-
-    def _fetch(url: str) -> str:
-        try:
-            r = requests.get(url, timeout=timeout,
-                             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-            if r.status_code != 200:
-                return ''
-            ip = _extract_ip(r.text)
-            return ip if _is_public_ipv4(ip) else ''
-        except Exception:
-            return ''
-
-    futs = []
-    results = []
-    try:
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, len(_PUBLIC_IP_SOURCES))) as ex:
-            for url in _PUBLIC_IP_SOURCES:
-                futs.append(ex.submit(_fetch, url))
-            for fut in concurrent.futures.as_completed(futs, timeout=timeout + 2):
-                try:
-                    ip = fut.result()
-                except Exception:
-                    continue
-                if ip:
-                    results.append(ip)
-    except Exception:
-        pass
-    finally:
-        for fut in futs:
-            try:
-                fut.cancel()
-            except Exception:
-                pass
-
-    if not results:
-        return ''
-
-    # 多数投票：本机若开着代理/VPN，部分源会返回代理出口 IP、部分返回真实
-    # 公网 IP，这里取出现次数最多的那个（平票时按探测顺序先到者优先）。
-    picked = max(results, key=lambda x: results.count(x))
-    if len(set(results)) > 1:
-        _safe_print(f'⚠️ 多个源返回了不同公网 IP: {sorted(set(results))}，采用多数结果 {picked}')
-    return picked
-
-
-def _get_lan_ip() -> str:
-    """取本机内网 IPv4（仅用于兜底，不是公网 IP）"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.settimeout(1.0)
-            s.connect(('8.8.8.8', 80))
-            return s.getsockname()[0]
-        finally:
-            s.close()
-    except Exception:
-        return ''
-
-
-def get_public_ip(force: bool = False) -> Optional[str]:
-    """获取本机公网 IPv4。
-
-    探测失败返回 None（不再返回内网 IP 冒充公网地址）。
-    force=True 忽略缓存重新探测。
-    """
-    import time as _time
-
-    now = _time.time()
-    if not force and _public_ip_cache['ip'] and now - _public_ip_cache['ts'] < PUBLIC_IP_TTL:
-        return _public_ip_cache['ip']
-
-    # ① 手工指定（环境变量或缓存目录下的文本文件，单行写 IP）
-    manual = (os.getenv('AUTOPCR_PUBLIC_IP') or '').strip()
-    if manual and not _is_public_ipv4(manual):
-        _safe_print(f'⚠️ AUTOPCR_PUBLIC_IP 不是合法公网 IP，已忽略: {manual}')
-        manual = ''
-    if manual:
-        _public_ip_cache.update({'ip': manual, 'ts': now})
-        return manual
-
-    # ② 多源并发探测
-    ip = _probe_public_ip()
-    if ip:
-        _public_ip_cache.update({'ip': ip, 'ts': now})
-        _safe_print(f'ℹ️ 自动探测到公网 IP: {ip}')
-        return ip
-
-    _safe_print('⚠️ 公网 IP 探测失败：所有接口均不可达（可能被墙或本机无外网出口）')
-    return None
-
-
-
-def get_hoshino_port() -> int:
-    """获取当前运行的HoshinoBot实际使用的端口号"""
-    try:
-        # 尝试从HoshinoBot配置文件中获取端口
-        from hoshino.config import __bot__ as bot_config
-        port = bot_config.PORT
-        # PORT 可能是 None / 字符串，这里统一校验成合法端口，避免生成 "IP:None"
-        try:
-            port_int = int(port)
-        except (TypeError, ValueError):
-            port_int = None
-        if port_int and 0 < port_int < 65536:
-            _safe_print(f"ℹ️ 从HoshinoBot配置中获取到端口: {port_int}")
-            return port_int
-        if port is not None:
-            _safe_print(f"⚠️ 配置中的PORT不合法: {port!r}，尝试从进程获取端口")
-    except ImportError:
-        _safe_print("⚠️ 无法导入hoshino.config.__bot__，尝试从进程获取端口")
-    except AttributeError:
-        _safe_print("⚠️ 配置中没有PORT属性，尝试从进程获取端口")
-    
-    # 如果从配置文件获取失败，回退到原来的进程检测方法
-    try:
-        # psutil 之前从未 import，走到这条回退分支会 NameError；这里惰性导入
-        import psutil
-        # 获取当前进程ID
-        current_pid = os.getpid()
-        
-        # 查找可能是HoshinoBot的Python进程
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'connections']):
-            try:
-                # 排除当前进程和非Python进程
-                if proc.info['pid'] == current_pid or 'python' not in proc.info['name'].lower():
-                    continue
-                
-                # 检查命令行参数是否包含hoshino相关字样
-                cmdline = ' '.join(proc.info['cmdline'] or [])
-                if 'hoshino' not in cmdline.lower():
-                    continue
-                
-                # 获取该进程监听的端口
-                for conn in proc.info['connections'] or []:
-                    if conn.status == 'LISTEN' and conn.laddr:
-                        return conn.laddr.port
-                        
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-                
-    except Exception as e:
-        _safe_print(f"⚠️ 无法从进程获取端口，使用默认8040。错误: {e}")
-    
-    return 8040  # 默认端口
-
-def _read_manual_address() -> Optional[str]:
-    """读取手工配置的对外地址。
-
-    优先级：环境变量 AUTOPCR_PUBLIC_ADDRESS > cache/manual_address.txt
-    支持两种写法：只写 IP（自动补当前端口），或直接写 "IP:端口"。
-    """
-    val = (os.getenv('AUTOPCR_PUBLIC_ADDRESS') or '').strip()
-    if not val:
-        try:
-            if os.path.exists(MANUAL_ADDRESS_FILE):
-                with open(MANUAL_ADDRESS_FILE, 'r', encoding='utf-8') as f:
-                    val = (f.read().strip().splitlines() or [''])[0].strip()
-        except Exception as e:
-            _safe_print(f'⚠️ 读取 {MANUAL_ADDRESS_FILE} 失败: {e}')
-    return val or None
-
-
-def generate_address() -> Optional[str]:
-    """生成 address（格式 '公网IP:端口'）；拿不到可用地址时返回 None。
-
-    返回 None 由下方统一兜底（PUBLIC_ADDRESS 配置 → 内网 IP），
-    绝不再返回"请手动填写…"这类占位文字，避免被拼进 URL。
-    """
-    port = get_hoshino_port()
-    _safe_print(f'ℹ️ 检测到运行中HoshinoBot使用的端口: {port}')
-
-    # ① 手工指定（IP 或 IP:端口）
-    manual = _read_manual_address()
-    if manual:
-        if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}:\d+', manual):
-            _safe_print(f'ℹ️ 使用手工配置地址: {manual}')
-            return manual
-        ip = _extract_ip(manual)
-        if ip:
-            addr = f'{ip}:{port}'
-            _safe_print(f'ℹ️ 使用手工配置 IP: {addr}')
-            return addr
-        _safe_print(f'⚠️ 手工配置的地址无法解析，已忽略: {manual}')
-
-    # ② 自动探测（严格校验公网 IP）
-    public_ip = get_public_ip()
-    if public_ip:
-        return f'{public_ip}:{port}'
-
-    # ③ 兜底：内网 IP（同局域网仍可访问，公网需自行端口映射）
-    lan_ip = _get_lan_ip()
-    if lan_ip:
-        _safe_print(f'⚠️ 未取到公网 IP，暂用内网地址 {lan_ip}:{port}')
-        _safe_print(f'   如需外网访问，请配置端口映射，或在 '
-              f'{MANUAL_ADDRESS_FILE} 写入公网IP（或设置环境变量 AUTOPCR_PUBLIC_ADDRESS）')
-        return f'{lan_ip}:{port}'
-
-    return None
-
-# ===== 自动获取 address =====
-address = generate_address()
-
-useHttps = False  # 默认HTTP
-
-# address 仍为空时，依次尝试 hoshino 配置与内网地址兜底
-if not address:
-    try:
-        from hoshino.config import PUBLIC_ADDRESS
-        if PUBLIC_ADDRESS:
-            address = str(PUBLIC_ADDRESS).strip()
-            _safe_print(f'ℹ️ 使用 hoshino.config.PUBLIC_ADDRESS: {address}')
-    except Exception:
-        pass
-
-if not address:
-    lan_ip = _get_lan_ip()
-    if lan_ip:
-        address = f'{lan_ip}:{get_hoshino_port()}'
-        _safe_print(f'⚠️ 未获取到公网 IP，使用内网地址: {address}')
-
-if not address:
-    # 极端情况：连内网 IP 都取不到，不阻塞模块加载，
-    # 仅把对外地址留空，指令里会给出明确提示。
-    address = ''
-    _safe_print('❌ 无法确定对外访问地址，请在 cache/manual_address.txt 写入公网IP')
-
-_safe_print(f"ℹ️ 当前address: {address or '(未配置)'}")
-
-_scheme = "https://" if useHttps else "http://"
-# address_ok: 是否拿到了可用的对外地址（False 时指令里给出明确提示，不拼出坏链接）
-address_ok = bool(address)
-# 统一带上 scheme，与原有下游用法（address + "login" 等）保持一致
-address = (_scheme + address + "/daily/") if address else ''
-
-# 便于指令里给用户提示：当前对外地址或配置指引
-def address_hint() -> str:
-    if address_ok:
-        return address + "login"
-    return ('❌ 机器人未获取到可用对外地址（公网IP探测失败）\n'
-            f'请二选一后重启机器人：\n'
-            f'1. 在 {MANUAL_ADDRESS_FILE} 写入一行公网IP（如 1.2.3.4）\n'
-            f'2. 设置环境变量 AUTOPCR_PUBLIC_ADDRESS=1.2.3.4\n'
-            f'当前端口: {get_hoshino_port()}')
-
 server = HttpServer(qq_mod=True)
 app = nonebot.get_bot().server_app
 QuartAuth(app, cookie_secure=False)
@@ -394,7 +54,6 @@ _auto_regroup_stop_events = {}
 prefix = '#'
 
 sv_help = f"""
-- 清日常创建    一切的开始
 - {prefix}配置日常  查地址
 - {prefix}清日常 [昵称] 无昵称则默认账号
 - {prefix}设置默认账号 [昵称] 设置默认账号（不填昵称=查看当前）
@@ -418,8 +77,8 @@ sv_help = f"""
 - {prefix}半月刊
 - {prefix}刷新box
 - {prefix}查缺称号 查看缺少的称号
-- {prefix}jjc透视 查前51名
-- {prefix}pjjc透视 查前51名
+- {prefix}jjc排名 查前51名
+- {prefix}pjjc排名 查前51名
 - {prefix}jjc回刺 比如 #jjc回刺 19 2 就是打19 选择阵容2进攻
 - {prefix}pjjc回刺 比如 #pjjc回刺 -1（或者不填） 就是打记录里第一条 
 - {prefix}pjjc换防 将pjjc防守阵容随机错排
@@ -469,9 +128,18 @@ sv_help = f"""
 - {prefix}恢复ex状态 恢复之前保存的普通EX装备穿戴状态
 - {prefix}黎明界刷开局 公会名
 - {prefix}清日常排序 5 1 3  (把1、3挪到5后面)
-- {prefix}黎明界积分 查询黎明界累计积分/强化点数
+- {prefix}查黎明界 查询黎明界累计积分/强化点数
 - {prefix}我的支援 查询支援情况
 """.strip()
+
+address = "xxxxxx.xxx"   # ← 换成你的域名
+useHttps = False         # 域名是否走 https
+
+def address_hint() -> str:
+    return f"{address}"
+
+address = ("https://" if useHttps else "http://") + address + "/daily/login"
+address_ok = True
 
 validate = ""
 
@@ -1725,7 +1393,7 @@ async def pjjc_back(botev: BotEvent):
     }
     return config
 
-@register_tool("jjc透视", "jjc_info")
+@register_tool("jjc排名", "jjc_info")
 async def jjc_info(botev: BotEvent):
     use_cache = True
     msg = await botev.message()
@@ -1739,7 +1407,7 @@ async def jjc_info(botev: BotEvent):
     }
     return config
 
-@register_tool("pjjc透视", "pjjc_info")
+@register_tool("pjjc排名", "pjjc_info")
 async def pjjc_info(botev: BotEvent):
     use_cache = True
     msg = await botev.message()
@@ -3868,7 +3536,7 @@ async def labyrinth_start_reroll(botev: BotEvent):
             "labyrinth_reroll_guild_id": guild_id,
     }
 
-@register_tool("黎明界积分", "labyrinth_point_query")  
+@register_tool("查黎明界", "labyrinth_point_query")  
 async def labyrinth_point_query(botev: BotEvent):  
     await botev.send("请稍等")  
     return {}
